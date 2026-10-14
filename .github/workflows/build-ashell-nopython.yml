@@ -31,6 +31,56 @@ jobs:
           # the prebuilt mini target.
           git -C a-shell submodule update --init
 
+      - name: Exclude two unpublished optional command frameworks
+        shell: bash
+        run: |
+          cd a-shell
+          python3 - <<'PY'
+          import plistlib
+          import re
+          from pathlib import Path
+
+          project_path = Path("a-Shell.xcodeproj/project.pbxproj")
+          project = project_path.read_text()
+          phase_id = "224A90682ADD0999006DB9CC"
+          phase = re.search(
+              rf"(?ms)^\s*{phase_id} /\* Embed Frameworks \*/ = \{{(.*?)^\s*\}};",
+              project,
+          )
+          if not phase:
+              raise SystemExit("Official noPython embed phase changed")
+          body = phase.group(1)
+          optional = {
+              "pico": "224A91682ADD0999006DB9CC",
+              "multimarkdown": "224A91692ADD0999006DB9CC",
+          }
+          for command, build_id in optional.items():
+              line = re.compile(
+                  rf"(?m)^\s*{build_id} /\* {command}\.framework in Embed Frameworks \*/,\n"
+              )
+              body, count = line.subn("", body)
+              if count != 1:
+                  raise SystemExit(f"Expected one noPython embed entry for {command}; found {count}")
+          project = project[:phase.start(1)] + body + project[phase.end(1):]
+          project_path.write_text(project)
+
+          dictionary_path = Path("Resources_mini/commandDictionary.plist")
+          with dictionary_path.open("rb") as stream:
+              dictionary = plistlib.load(stream)
+          for command in optional:
+              entry = dictionary.get(command)
+              if not entry or entry[0] != f"{command}.framework/{command}":
+                  raise SystemExit(f"Unexpected {command} command mapping")
+              del dictionary[command]
+              stub = Path("Resources_mini/bin") / command
+              if not stub.exists() or stub.stat().st_size != 0:
+                  raise SystemExit(f"Unexpected {command} command stub")
+              stub.unlink()
+          with dictionary_path.open("wb") as stream:
+              plistlib.dump(dictionary, stream)
+          print("Excluded only pico and multimarkdown; other command mappings preserved")
+          PY
+
       - name: Preflight official noPython dependencies
         shell: bash
         run: |
@@ -199,6 +249,7 @@ jobs:
         run: |
           cd a-shell
           python3 - <<'PY'
+          import plistlib
           import re
           from pathlib import Path
 
@@ -220,9 +271,20 @@ jobs:
               path = Path(file_ref.group(1).strip('"'))
               if not path.exists():
                   missing.append(str(path))
+              elif path.suffix == ".xcframework":
+                  with (path / "Info.plist").open("rb") as stream:
+                      metadata = plistlib.load(stream)
+                  device_slice = any(
+                      library.get("SupportedPlatform") == "ios"
+                      and not library.get("SupportedPlatformVariant")
+                      and "arm64" in library.get("SupportedArchitectures", [])
+                      for library in metadata.get("AvailableLibraries", [])
+                  )
+                  if not device_slice:
+                      raise SystemExit(f"No iOS arm64 device slice in {path}")
           if missing:
               raise SystemExit("Missing required framework paths:\n" + "\n".join(sorted(missing)))
-          print("All official noPython embedded framework paths exist")
+          print("All official noPython embedded frameworks have iOS arm64 device slices")
           PY
 
       - name: Build verified a-Shell-noPython target without signing
