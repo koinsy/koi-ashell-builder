@@ -93,11 +93,16 @@ jobs:
           artifacts.mkdir(parents=True, exist_ok=True)
           downloads.mkdir(parents=True, exist_ok=True)
           targets = []
-          for name in sorted(required_outputs & pinned_targets.keys()):
-              url, expected = pinned_targets[name]
-              current = current_targets.get(name)
-              if current and current[0] == url:
-                  expected = current[1]
+          for name in sorted(required_outputs & (pinned_targets.keys() | current_targets.keys())):
+              if name in pinned_targets:
+                  url, expected = pinned_targets[name]
+                  current = current_targets.get(name)
+                  if current and current[0] == url:
+                      expected = current[1]
+              else:
+                  # Two mini inputs (ssh_cmdA and ssh_agent) were added to the
+                  # official catalog after the pinned project revision.
+                  url, expected = current_targets[name]
               targets.append((name, url, expected))
           if not targets:
               raise SystemExit("No a-Shell-mini binary targets found")
@@ -118,11 +123,31 @@ jobs:
                   )
               with zipfile.ZipFile(archive) as bundle:
                   bundle.extractall(artifacts)
+
+          # SwiftPM stores these two targets one level below the other binary
+          # artifacts. Reproduce that documented artifact layout without asking
+          # SwiftPM to resolve the unused catalog.
+          for nested in ("libssh2", "openssl"):
+              source = artifacts / f"{nested}.xcframework"
+              destination = artifacts / nested / source.name
+              destination.parent.mkdir(exist_ok=True)
+              if source.exists() and not destination.exists():
+                  source.rename(destination)
           PY
 
           curl -fsSL -o pythonInstall.tar.gz \
             https://github.com/holzschu/a-shell/releases/download/cpython_05_22/pythonInstall.tar.gz
           tar xzf pythonInstall.tar.gz
+
+          # The official release asset has changed its outer directory layout
+          # over time. The pinned project expects cpython/XcFrameworks.
+          if [[ ! -d cpython/XcFrameworks ]]; then
+            PYTHON_XCFRAMEWORKS=$(find . -type d -name XcFrameworks -print -quit)
+            test -n "$PYTHON_XCFRAMEWORKS"
+            mkdir -p cpython
+            mv "$PYTHON_XCFRAMEWORKS" cpython/XcFrameworks
+          fi
+          test -d cpython/XcFrameworks
 
           # The Xcode project references these two official manifest artifacts
           # through cpython/Python-aux rather than xcfs' artifact directory.
