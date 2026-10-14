@@ -42,27 +42,80 @@ jobs:
           import zipfile
           from pathlib import Path
 
+          # Resolve only binary targets referenced by a-Shell-mini's Frameworks
+          # and Embed Frameworks phases.  The complete official package catalog
+          # contains large TeX/LLVM/Perl frameworks that mini does not embed.
+          project = Path("a-Shell.xcodeproj/project.pbxproj").read_text()
+          phase_ids = ("229D2486257931E4004A78AC", "229D24A1257931E4004A78AC")
+          required_outputs = set()
+          for phase_id in phase_ids:
+              phase = re.search(
+                  rf"\b{phase_id} /\*.*?\*/ = \{{(.*?)\n\s*\}};",
+                  project,
+                  re.S,
+              )
+              if not phase:
+                  raise SystemExit(f"Missing a-Shell-mini build phase {phase_id}")
+              required_outputs.update(
+                  name.removesuffix(".xcframework")
+                  for name in re.findall(
+                      r"/\* (.+?) in (?:Frameworks|Embed Frameworks) \*/",
+                      phase.group(1),
+                  )
+              )
+
           manifest = Path("xcfs/Package.swift").read_text()
           pattern = re.compile(
               r'\.binaryTarget\(\s*name:\s*"([^"]+)"\s*,\s*'
               r'url:\s*"([^"]+)"\s*,\s*checksum:\s*"([0-9a-f]+)"\s*\)',
               re.S,
           )
+          pinned_targets = {
+              name: (url, checksum)
+              for name, url, checksum in pattern.findall(manifest)
+          }
+
+          # Some GitHub release assets were replaced in place after this source
+          # revision.  Use checksum corrections only where the current pinned
+          # official manifest names the exact same URL.
+          metadata_url = (
+              "https://raw.githubusercontent.com/holzschu/a-shell/"
+              "350327e186dc471269d6f0f576d267cdbcc5d304/xcfs/Package.swift"
+          )
+          current_manifest = urllib.request.urlopen(metadata_url).read().decode()
+          current_targets = {
+              name: (url, checksum)
+              for name, url, checksum in pattern.findall(current_manifest)
+          }
+
           artifacts = Path("xcfs/.build/artifacts/xcfs")
           downloads = Path("xcfs/.build/downloads")
           artifacts.mkdir(parents=True, exist_ok=True)
           downloads.mkdir(parents=True, exist_ok=True)
-          targets = pattern.findall(manifest)
+          targets = []
+          for name in sorted(required_outputs & pinned_targets.keys()):
+              url, expected = pinned_targets[name]
+              current = current_targets.get(name)
+              if current and current[0] == url:
+                  expected = current[1]
+              targets.append((name, url, expected))
           if not targets:
-              raise SystemExit("No binary targets found in official manifest")
+              raise SystemExit("No a-Shell-mini binary targets found")
+          print(f"a-Shell-mini requires {len(targets)} official binary archives")
 
           for name, url, expected in targets:
               archive = downloads / f"{name}.zip"
               print(f"Downloading {name}", flush=True)
               urllib.request.urlretrieve(url, archive)
-              actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+              digest = hashlib.sha256()
+              with archive.open("rb") as payload:
+                  for chunk in iter(lambda: payload.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              actual = digest.hexdigest()
               if actual != expected:
-                  raise SystemExit(f"Checksum mismatch for {name}")
+                  raise SystemExit(
+                      f"Checksum mismatch for {name}: expected {expected}, got {actual}"
+                  )
               with zipfile.ZipFile(archive) as bundle:
                   bundle.extractall(artifacts)
           PY
@@ -71,13 +124,22 @@ jobs:
             https://github.com/holzschu/a-shell/releases/download/cpython_05_22/pythonInstall.tar.gz
           tar xzf pythonInstall.tar.gz
 
+          # The Xcode project references these two official manifest artifacts
+          # through cpython/Python-aux rather than xcfs' artifact directory.
           mkdir -p cpython/Python-aux "$RUNNER_TEMP/python-aux"
-          for framework in freetype harfbuzz libpng; do
-            curl -fsSL -o "$RUNNER_TEMP/python-aux/$framework.zip" \
-              "https://github.com/holzschu/Python-aux/releases/download/1.0/$framework.xcframework.zip"
-            unzip -q -o "$RUNNER_TEMP/python-aux/$framework.zip" -d cpython/Python-aux
-            test -d "cpython/Python-aux/$framework.xcframework"
-          done
+          cp -R xcfs/.build/artifacts/xcfs/freetype.xcframework cpython/Python-aux/
+          cp -R xcfs/.build/artifacts/xcfs/harfbuzz.xcframework cpython/Python-aux/
+
+          # libpng is an explicit a-Shell-mini Xcode input published by the same
+          # official Python-aux release, but is not part of a-Shell's xcfs catalog.
+          curl -fsSL -o "$RUNNER_TEMP/python-aux/libpng.zip" \
+            https://github.com/holzschu/Python-aux/releases/download/1.0/libpng.xcframework.zip
+          echo "30ff80e9a2c20d7f266e7f788e94e44b2e105ac9c8107b44eb91f6869d6d8aa4  $RUNNER_TEMP/python-aux/libpng.zip" | shasum -a 256 -c -
+          unzip -q -o "$RUNNER_TEMP/python-aux/libpng.zip" -d cpython/Python-aux
+
+          test -d cpython/Python-aux/freetype.xcframework
+          test -d cpython/Python-aux/harfbuzz.xcframework
+          test -d cpython/Python-aux/libpng.xcframework
 
       - name: Build verified a-Shell-mini target without signing
         shell: bash
