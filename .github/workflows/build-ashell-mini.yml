@@ -35,7 +35,37 @@ jobs:
         shell: bash
         run: |
           cd a-shell
-          swift package --package-path xcfs resolve
+          python3 - <<'PY'
+          import hashlib
+          import re
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          manifest = Path("xcfs/Package.swift").read_text()
+          pattern = re.compile(
+              r'\.binaryTarget\(\s*name:\s*"([^"]+)"\s*,\s*'
+              r'url:\s*"([^"]+)"\s*,\s*checksum:\s*"([0-9a-f]+)"\s*\)',
+              re.S,
+          )
+          artifacts = Path("xcfs/.build/artifacts/xcfs")
+          downloads = Path("xcfs/.build/downloads")
+          artifacts.mkdir(parents=True, exist_ok=True)
+          downloads.mkdir(parents=True, exist_ok=True)
+          targets = pattern.findall(manifest)
+          if not targets:
+              raise SystemExit("No binary targets found in official manifest")
+
+          for name, url, expected in targets:
+              archive = downloads / f"{name}.zip"
+              print(f"Downloading {name}", flush=True)
+              urllib.request.urlretrieve(url, archive)
+              actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+              if actual != expected:
+                  raise SystemExit(f"Checksum mismatch for {name}")
+              with zipfile.ZipFile(archive) as bundle:
+                  bundle.extractall(artifacts)
+          PY
 
           curl -fsSL -o pythonInstall.tar.gz \
             https://github.com/holzschu/a-shell/releases/download/cpython_05_22/pythonInstall.tar.gz
