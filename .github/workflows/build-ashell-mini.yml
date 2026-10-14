@@ -24,7 +24,10 @@ jobs:
         shell: bash
         run: |
           git config --global url."https://github.com/".insteadOf git@github.com:
-          git -C a-shell submodule update --init --recursive
+          # The mini target consumes the two top-level source submodules. CPython's
+          # nested package-building repositories are not build inputs here, and one
+          # currently references an upstream commit that is no longer fetchable.
+          git -C a-shell submodule update --init SwiftTerm cpython
 
       - name: Download documented xcFramework dependencies
         shell: bash
