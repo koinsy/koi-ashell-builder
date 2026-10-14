@@ -1,0 +1,67 @@
+name: Build official a-Shell mini unsigned IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Check out pinned official a-Shell source
+        uses: actions/checkout@v4
+        with:
+          repository: holzschu/a-shell
+          ref: 350327e186dc471269d6f0f576d267cdbcc5d304
+          path: a-shell
+          fetch-depth: 1
+          submodules: false
+
+      - name: Initialize official submodules
+        shell: bash
+        run: |
+          git config --global url."https://github.com/".insteadOf git@github.com:
+          git -C a-shell submodule update --init --recursive
+
+      - name: Download documented xcFramework dependencies
+        shell: bash
+        run: |
+          cd a-shell
+          cp Configuration.sample.xcconfig Configuration.xcconfig
+          sh ./downloadFrameworks.sh
+
+      - name: Build verified a-Shell-mini target without signing
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ashell-products"
+          xcodebuild \
+            -project a-shell/a-Shell.xcodeproj \
+            -target a-Shell-mini \
+            -configuration Release \
+            -sdk iphoneos \
+            SYMROOT="$RUNNER_TEMP/ashell-products" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          APP=$(find "$RUNNER_TEMP/ashell-products" -type d -name 'a-Shell-mini.app' -print -quit)
+          test -n "$APP"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          ditto "$APP" "$RUNNER_TEMP/ipa/Payload/a-Shell-mini.app"
+          cd "$RUNNER_TEMP/ipa"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/a-Shell-mini-unsigned.ipa" Payload
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: a-Shell-mini-official-unsigned
+          path: a-Shell-mini-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
