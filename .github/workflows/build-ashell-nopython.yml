@@ -15,9 +15,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: holzschu/a-shell
-          # Last official source revision before an unreleased browser framework
-          # became a required local Xcode reference.
-          ref: 134e8799543bfd97699f7bbbdbe0ca5ddc366d75
+          # Closest official revision containing the noPython target's jsc.swift.
+          # Its Xcode project is identical to the previous pinned revision.
+          ref: 128c4051c239b1bd2f155bd34ea606c0bc7211f1
           path: a-shell
           fetch-depth: 1
           submodules: false
@@ -36,11 +36,16 @@ jobs:
         run: |
           cd a-shell
           python3 - <<'PY'
+          import hashlib
           import plistlib
           import re
           from pathlib import Path
 
           project_path = Path("a-Shell.xcodeproj/project.pbxproj")
+          project_digest = hashlib.sha256(project_path.read_bytes()).hexdigest()
+          expected_digest = "051d6a0de975a15e4b127cabd5032ca0ae5be3c540bf7c069b77847b1b968b51"
+          if project_digest != expected_digest:
+              raise SystemExit("Official noPython project changed from audited revision")
           project = project_path.read_text()
           phase_id = "224A90682ADD0999006DB9CC"
           phase = re.search(
@@ -79,6 +84,93 @@ jobs:
           with dictionary_path.open("wb") as stream:
               plistlib.dump(dictionary, stream)
           print("Excluded only pico and multimarkdown; other command mappings preserved")
+          PY
+
+      - name: Preflight noPython source and resource files
+        shell: bash
+        run: |
+          cd a-shell
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          project = Path("a-Shell.xcodeproj/project.pbxproj").read_text()
+          objects = {}
+          for line in project.splitlines():
+              match = re.match(r"\s*([A-F0-9]{24}) /\*.*?\*/ = \{(.*)\};", line)
+              if match:
+                  objects[match.group(1)] = match.group(2)
+          objects.update({
+              match.group(1): match.group(2)
+              for match in re.finditer(
+                  r"(?ms)^\t\t([A-F0-9]{24}) /\*[^\n]*?\*/ = \{\n(.*?)^\t\t\};",
+                  project,
+              )
+          })
+
+          def value(body, key):
+              match = re.search(rf'\b{key} = ("[^"]*"|[^;]*);', body)
+              return match.group(1).strip('"') if match else None
+
+          def ids(body, key):
+              match = re.search(rf"\b{key} = \((.*?)\);", body, re.S)
+              if not match:
+                  return []
+              return re.findall(r"([A-F0-9]{24}) /\*", match.group(1))
+
+          parents = {}
+          for object_id, body in objects.items():
+              if value(body, "isa") in {"PBXGroup", "PBXVariantGroup"}:
+                  for child in ids(body, "children"):
+                      parents[child] = object_id
+
+          def source_path(file_id):
+              body = objects[file_id]
+              parts = [value(body, "path") or value(body, "name")]
+              if value(body, "sourceTree") == "SOURCE_ROOT":
+                  return Path(parts[0])
+              parent = parents.get(file_id)
+              while parent:
+                  group = objects[parent]
+                  group_path = value(group, "path")
+                  if group_path:
+                      parts.insert(0, group_path)
+                  if value(group, "sourceTree") == "SOURCE_ROOT":
+                      break
+                  parent = parents.get(parent)
+              return Path(*[part for part in parts if part])
+
+          def check_file(file_id):
+              body = objects[file_id]
+              if value(body, "isa") == "PBXVariantGroup":
+                  return [check_file(child) for child in ids(body, "children")]
+              location = source_path(file_id)
+              if not location.exists():
+                  raise SystemExit(f"Missing noPython source/resource: {location}")
+              return str(location)
+
+          target_ids = ["224A90352ADD0999006DB9CC"]
+          checked = 0
+          for target_id in target_ids:
+              target = objects[target_id]
+              for dependency_id in ids(target, "dependencies"):
+                  dependency = objects[dependency_id]
+                  child_target = value(dependency, "target")
+                  if child_target:
+                      target_ids.append(child_target.split()[0])
+              for phase_id in ids(target, "buildPhases"):
+                  phase = objects[phase_id]
+                  if value(phase, "isa") not in {"PBXSourcesBuildPhase", "PBXResourcesBuildPhase"}:
+                      continue
+                  for build_id in ids(phase, "files"):
+                      reference = value(objects[build_id], "fileRef")
+                      if not reference:
+                          raise SystemExit(f"Missing fileRef for {build_id}")
+                      check_file(reference.split()[0])
+                      checked += 1
+          if not Path("a-Shell/Util/jsc.swift").exists():
+              raise SystemExit("Official JavaScriptCore source jsc.swift is missing")
+          print(f"Validated {checked} noPython and extension source/resource references")
           PY
 
       - name: Preflight official noPython dependencies
