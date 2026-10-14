@@ -1,0 +1,259 @@
+name: Build official a-Shell noPython unsigned IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Check out pinned official a-Shell source
+        uses: actions/checkout@v4
+        with:
+          repository: holzschu/a-shell
+          # Last official source revision before an unreleased browser framework
+          # became a required local Xcode reference.
+          ref: 134e8799543bfd97699f7bbbdbe0ca5ddc366d75
+          path: a-shell
+          fetch-depth: 1
+          submodules: false
+
+      - name: Initialize official submodules
+        shell: bash
+        run: |
+          git config --global url."https://github.com/".insteadOf git@github.com:
+          # Initialize every top-level submodule at this pinned revision. Avoid
+          # CPython's nested package-building repositories, which are not inputs to
+          # the prebuilt mini target.
+          git -C a-shell submodule update --init
+
+      - name: Preflight official noPython dependencies
+        shell: bash
+        run: |
+          cd a-shell
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          from urllib.request import urlopen
+
+          project = Path("a-Shell.xcodeproj/project.pbxproj").read_text()
+          phase_ids = ("224A904C2ADD0999006DB9CC", "224A90682ADD0999006DB9CC")
+          required = set()
+          for phase_id in phase_ids:
+              phase = re.search(
+                  rf"(?ms)^\s*{phase_id} /\* (?:Frameworks|Embed Frameworks) \*/ = \{{(.*?)^\s*\}};",
+                  project,
+              )
+              if not phase:
+                  raise SystemExit(f"Missing official noPython build phase {phase_id}")
+              required.update(re.findall(r"/\* (.+?) in (?:Frameworks|Embed Frameworks) \*/", phase.group(1)))
+
+          pattern = re.compile(
+              r'\.binaryTarget\(\s*name:\s*"([^"]+)"\s*,\s*'
+              r'url:\s*"([^"]+)"\s*,\s*checksum:\s*"([0-9a-f]+)"\s*\)',
+              re.S,
+          )
+          pinned = {name for name, _, _ in pattern.findall(Path("xcfs/Package.swift").read_text())}
+          current_url = (
+              "https://raw.githubusercontent.com/holzschu/a-shell/"
+              "350327e186dc471269d6f0f576d267cdbcc5d304/xcfs/Package.swift"
+          )
+          current = {name for name, _, _ in pattern.findall(urlopen(current_url).read().decode())}
+          # libpng is published in the official Python-aux 1.0 release and
+          # verified by SHA-256 in the download step below.
+          covered = {f"{name}.xcframework" for name in pinned | current | {"libpng"}}
+          unresolved = sorted(required - covered)
+          print(f"Official noPython target: {len(required)} frameworks")
+          print(f"Manifest or official release backed: {len(required) - len(unresolved)}")
+          if unresolved:
+              raise SystemExit("No verified official dependency for: " + ", ".join(unresolved))
+          PY
+
+      - name: Download documented xcFramework dependencies
+        shell: bash
+        run: |
+          cd a-shell
+          python3 - <<'PY'
+          import hashlib
+          import re
+          import urllib.request
+          import zipfile
+          from pathlib import Path
+
+          # Resolve only binary targets referenced by a-Shell-noPython's Frameworks
+          # and Embed Frameworks phases.  The complete official package catalog
+          # contains large TeX/LLVM/Perl frameworks that noPython does not embed.
+          project = Path("a-Shell.xcodeproj/project.pbxproj").read_text()
+          phase_ids = ("224A904C2ADD0999006DB9CC", "224A90682ADD0999006DB9CC")
+          required_outputs = set()
+          for phase_id in phase_ids:
+              phase = re.search(
+                  rf"\b{phase_id} /\*.*?\*/ = \{{(.*?)\n\s*\}};",
+                  project,
+                  re.S,
+              )
+              if not phase:
+                  raise SystemExit(f"Missing a-Shell-noPython build phase {phase_id}")
+              required_outputs.update(
+                  name.removesuffix(".xcframework")
+                  for name in re.findall(
+                      r"/\* (.+?) in (?:Frameworks|Embed Frameworks) \*/",
+                      phase.group(1),
+                  )
+              )
+
+          manifest = Path("xcfs/Package.swift").read_text()
+          pattern = re.compile(
+              r'\.binaryTarget\(\s*name:\s*"([^"]+)"\s*,\s*'
+              r'url:\s*"([^"]+)"\s*,\s*checksum:\s*"([0-9a-f]+)"\s*\)',
+              re.S,
+          )
+          pinned_targets = {
+              name: (url, checksum)
+              for name, url, checksum in pattern.findall(manifest)
+          }
+
+          # Some GitHub release assets were replaced in place after this source
+          # revision.  Use checksum corrections only where the current pinned
+          # official manifest names the exact same URL.
+          metadata_url = (
+              "https://raw.githubusercontent.com/holzschu/a-shell/"
+              "350327e186dc471269d6f0f576d267cdbcc5d304/xcfs/Package.swift"
+          )
+          current_manifest = urllib.request.urlopen(metadata_url).read().decode()
+          current_targets = {
+              name: (url, checksum)
+              for name, url, checksum in pattern.findall(current_manifest)
+          }
+
+          artifacts = Path("xcfs/.build/artifacts/xcfs")
+          downloads = Path("xcfs/.build/downloads")
+          artifacts.mkdir(parents=True, exist_ok=True)
+          downloads.mkdir(parents=True, exist_ok=True)
+          targets = []
+          for name in sorted(required_outputs & (pinned_targets.keys() | current_targets.keys())):
+              if name in pinned_targets:
+                  url, expected = pinned_targets[name]
+                  current = current_targets.get(name)
+                  if current and current[0] == url:
+                      expected = current[1]
+              else:
+                  # Two mini inputs (ssh_cmdA and ssh_agent) were added to the
+                  # official catalog after the pinned project revision.
+                  url, expected = current_targets[name]
+              targets.append((name, url, expected))
+          if not targets:
+              raise SystemExit("No a-Shell-noPython binary targets found")
+          print(f"a-Shell-noPython requires {len(targets)} official binary archives")
+
+          for name, url, expected in targets:
+              archive = downloads / f"{name}.zip"
+              print(f"Downloading {name}", flush=True)
+              urllib.request.urlretrieve(url, archive)
+              digest = hashlib.sha256()
+              with archive.open("rb") as payload:
+                  for chunk in iter(lambda: payload.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              actual = digest.hexdigest()
+              if actual != expected:
+                  raise SystemExit(
+                      f"Checksum mismatch for {name}: expected {expected}, got {actual}"
+                  )
+              with zipfile.ZipFile(archive) as bundle:
+                  bundle.extractall(artifacts)
+
+          # SwiftPM stores these two targets one level below the other binary
+          # artifacts. Reproduce that documented artifact layout without asking
+          # SwiftPM to resolve the unused catalog.
+          for nested in ("libssh2", "openssl"):
+              source = artifacts / f"{nested}.xcframework"
+              destination = artifacts / nested / source.name
+              destination.parent.mkdir(exist_ok=True)
+              if source.exists() and not destination.exists():
+                  source.rename(destination)
+          PY
+
+          # The Xcode project references these two official manifest artifacts
+          # through cpython/Python-aux rather than xcfs' artifact directory.
+          mkdir -p cpython/Python-aux "$RUNNER_TEMP/python-aux"
+          cp -R xcfs/.build/artifacts/xcfs/freetype.xcframework cpython/Python-aux/
+          cp -R xcfs/.build/artifacts/xcfs/harfbuzz.xcframework cpython/Python-aux/
+
+          # libpng is an explicit a-Shell-noPython Xcode input published by the same
+          # official Python-aux release, but is not part of a-Shell's xcfs catalog.
+          curl -fsSL -o "$RUNNER_TEMP/python-aux/libpng.zip" \
+            https://github.com/holzschu/Python-aux/releases/download/1.0/libpng.xcframework.zip
+          echo "30ff80e9a2c20d7f266e7f788e94e44b2e105ac9c8107b44eb91f6869d6d8aa4  $RUNNER_TEMP/python-aux/libpng.zip" | shasum -a 256 -c -
+          unzip -q -o "$RUNNER_TEMP/python-aux/libpng.zip" -d cpython/Python-aux
+
+          test -d cpython/Python-aux/freetype.xcframework
+          test -d cpython/Python-aux/harfbuzz.xcframework
+          test -d cpython/Python-aux/libpng.xcframework
+
+      - name: Preflight Xcode framework paths
+        shell: bash
+        run: |
+          cd a-shell
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          project = Path("a-Shell.xcodeproj/project.pbxproj").read_text()
+          phase = re.search(
+              r"(?ms)^\s*224A90682ADD0999006DB9CC /\* Embed Frameworks \*/ = \{(.*?)^\s*\};",
+              project,
+          )
+          if not phase:
+              raise SystemExit("Missing official noPython embed phase")
+          missing = []
+          for build_id in re.findall(r"([A-F0-9]{24}) /\* .+? in Embed Frameworks \*/", phase.group(1)):
+              build = re.search(rf"(?m)^\s*{build_id} /\*.*?\*/ = .*?fileRef = ([A-F0-9]{{24}})", project)
+              if not build:
+                  raise SystemExit(f"Missing PBXBuildFile {build_id}")
+              file_ref = re.search(rf"(?m)^\s*{build.group(1)} /\*.*?\*/ = .*?path = (\"[^\"]+\"|[^;]+);", project)
+              if not file_ref:
+                  raise SystemExit(f"Missing PBXFileReference {build.group(1)}")
+              path = Path(file_ref.group(1).strip('"'))
+              if not path.exists():
+                  missing.append(str(path))
+          if missing:
+              raise SystemExit("Missing required framework paths:\n" + "\n".join(sorted(missing)))
+          print("All official noPython embedded framework paths exist")
+          PY
+
+      - name: Build verified a-Shell-noPython target without signing
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/ashell-products"
+          xcodebuild \
+            -project a-shell/a-Shell.xcodeproj \
+            -target a-Shell-noPython \
+            -configuration Release \
+            -sdk iphoneos \
+            SYMROOT="$RUNNER_TEMP/ashell-products" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          APP=$(find "$RUNNER_TEMP/ashell-products" -type d -name 'a-Shell-noPython.app' -print -quit)
+          test -n "$APP"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          ditto "$APP" "$RUNNER_TEMP/ipa/Payload/a-Shell-noPython.app"
+          cd "$RUNNER_TEMP/ipa"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/a-Shell-noPython-unsigned.ipa" Payload
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: a-Shell-noPython-official-unsigned
+          path: a-Shell-noPython-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
