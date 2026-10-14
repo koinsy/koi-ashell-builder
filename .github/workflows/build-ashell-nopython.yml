@@ -31,7 +31,7 @@ jobs:
           # the prebuilt mini target.
           git -C a-shell submodule update --init
 
-      - name: Exclude two unpublished optional command frameworks
+      - name: Prepare official noPython target
         shell: bash
         run: |
           cd a-shell
@@ -67,6 +67,64 @@ jobs:
               if count != 1:
                   raise SystemExit(f"Expected one noPython embed entry for {command}; found {count}")
           project = project[:phase.start(1)] + body + project[phase.end(1):]
+
+          # The official full and mini targets link the same Vapor package used
+          # by AppDelegate and SceneDelegate. The noPython target omits that
+          # linkage, even though it compiles those source files. Add only the
+          # missing product dependency and Frameworks entry.
+          vapor_build = "A5E110000000000000000001"
+          vapor_product = "A5E110000000000000000002"
+          vapor_package = "2213DCC12BDFEF8F008BD5F2"
+          if any(item in project for item in (vapor_build, vapor_product)):
+              raise SystemExit("Reserved noPython Vapor project ID already exists")
+          if f'{vapor_package} /* XCRemoteSwiftPackageReference "vapor" */' not in project:
+              raise SystemExit("Official Vapor package reference is missing")
+          def replace_once(old, new):
+              global project
+              if project.count(old) != 1:
+                  raise SystemExit(f"Expected one project anchor: {old[:80]}")
+              project = project.replace(old, new, 1)
+
+          replace_once(
+              "/* End PBXBuildFile section */",
+              f"\t\t{vapor_build} /* Vapor in Frameworks */ = "
+              f"{{isa = PBXBuildFile; productRef = {vapor_product} /* Vapor */; }};\n"
+              "/* End PBXBuildFile section */",
+          )
+          replace_once(
+              "/* End XCSwiftPackageProductDependency section */",
+              f"\t\t{vapor_product} /* Vapor */ = {{\n"
+              "\t\t\tisa = XCSwiftPackageProductDependency;\n"
+              f"\t\t\tpackage = {vapor_package} /* XCRemoteSwiftPackageReference \"vapor\" */;\n"
+              "\t\t\tproductName = Vapor;\n"
+              "\t\t};\n"
+              "/* End XCSwiftPackageProductDependency section */",
+          )
+          replace_once(
+              "224A904C2ADD0999006DB9CC /* Frameworks */ = {\n"
+              "\t\t\tisa = PBXFrameworksBuildPhase;\n"
+              "\t\t\tbuildActionMask = 2147483647;\n"
+              "\t\t\tfiles = (\n"
+              "\t\t\t\t224A904D2ADD0999006DB9CC /* ios_system.xcframework in Frameworks */,",
+              "224A904C2ADD0999006DB9CC /* Frameworks */ = {\n"
+              "\t\t\tisa = PBXFrameworksBuildPhase;\n"
+              "\t\t\tbuildActionMask = 2147483647;\n"
+              "\t\t\tfiles = (\n"
+              "\t\t\t\t224A904D2ADD0999006DB9CC /* ios_system.xcframework in Frameworks */,\n"
+              f"\t\t\t\t{vapor_build} /* Vapor in Frameworks */,",
+          )
+          target = re.search(
+              r"(?ms)^\s*224A90352ADD0999006DB9CC /\* a-Shell-noPython \*/ = "
+              r"\{(.*?)^\s*\};", project,
+          )
+          if not target or "packageProductDependencies = (\n\t\t\t);" not in target.group(1):
+              raise SystemExit("Official noPython package dependency list changed")
+          target_body = target.group(1).replace(
+              "packageProductDependencies = (\n\t\t\t);",
+              f"packageProductDependencies = (\n\t\t\t\t{vapor_product} /* Vapor */,\n\t\t\t);",
+              1,
+          )
+          project = project[:target.start(1)] + target_body + project[target.end(1):]
           project_path.write_text(project)
 
           dictionary_path = Path("Resources_mini/commandDictionary.plist")
@@ -83,8 +141,55 @@ jobs:
               stub.unlink()
           with dictionary_path.open("wb") as stream:
               plistlib.dump(dictionary, stream)
-          print("Excluded only pico and multimarkdown; other command mappings preserved")
+          print("Linked official Vapor package; excluded only pico and multimarkdown")
           PY
+
+      - name: Preflight Xcode project and Vapor linkage
+        shell: bash
+        run: |
+          cd a-shell
+          plutil -lint a-Shell.xcodeproj/project.pbxproj
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          project = Path("a-Shell.xcodeproj/project.pbxproj").read_text()
+          build = "A5E110000000000000000001"
+          product = "A5E110000000000000000002"
+          package = "2213DCC12BDFEF8F008BD5F2"
+          phase = re.search(
+              r"(?ms)^\s*224A904C2ADD0999006DB9CC /\* Frameworks \*/ = \{(.*?)^\s*\};",
+              project,
+          )
+          target = re.search(
+              r"(?ms)^\s*224A90352ADD0999006DB9CC /\* a-Shell-noPython \*/ = \{(.*?)^\s*\};",
+              project,
+          )
+          if not phase or not target:
+              raise SystemExit("Official noPython target or Frameworks phase missing")
+          if f"{build} /* Vapor in Frameworks */" not in phase.group(1):
+              raise SystemExit("Vapor absent from noPython Frameworks phase")
+          if f"{product} /* Vapor */" not in target.group(1):
+              raise SystemExit("Vapor absent from noPython package dependencies")
+          if not re.search(
+              rf"{build} /\* Vapor in Frameworks \*/ = \{{isa = PBXBuildFile; "
+              rf"productRef = {product} /\* Vapor \*/; \}};", project,
+          ):
+              raise SystemExit("Vapor build file does not resolve to package product")
+          if not re.search(
+              rf"{product} /\* Vapor \*/ = \{{.*?package = {package} "
+              r"/\* XCRemoteSwiftPackageReference \"vapor\" \*/;.*?productName = Vapor;",
+              project, re.S,
+          ):
+              raise SystemExit("Vapor product does not resolve to official package")
+          for source in ("a-Shell/AppDelegate.swift", "a-Shell/SceneDelegate.swift"):
+              if "import Vapor" not in Path(source).read_text(encoding="utf-8"):
+                  raise SystemExit(f"Expected official Vapor import missing in {source}")
+          print("Official Vapor package linked to noPython target and imports")
+          PY
+          xcodebuild -resolvePackageDependencies \
+            -project a-Shell.xcodeproj \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/ashell-swift-packages"
 
       - name: Preflight noPython source and resource files
         shell: bash
@@ -193,6 +298,10 @@ jobs:
               if not phase:
                   raise SystemExit(f"Missing official noPython build phase {phase_id}")
               required.update(re.findall(r"/\* (.+?) in (?:Frameworks|Embed Frameworks) \*/", phase.group(1)))
+          # Vapor is checked and resolved in the Swift-package preflight above.
+          if "Vapor" not in required:
+              raise SystemExit("Vapor missing from noPython Frameworks phase")
+          required.remove("Vapor")
 
           pattern = re.compile(
               r'\.binaryTarget\(\s*name:\s*"([^"]+)"\s*,\s*'
@@ -388,6 +497,7 @@ jobs:
             -target a-Shell-noPython \
             -configuration Release \
             -sdk iphoneos \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/ashell-swift-packages" \
             SYMROOT="$RUNNER_TEMP/ashell-products" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
