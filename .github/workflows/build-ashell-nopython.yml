@@ -396,6 +396,17 @@ jobs:
                   # Two mini inputs (ssh_cmdA and ssh_agent) were added to the
                   # official catalog after the pinned project revision.
                   url, expected = current_targets[name]
+              if name == "ios_system":
+                  if not url.endswith("/v3.0.2/ios_system.xcframework.zip"):
+                      raise SystemExit("Unexpected pinned ios_system dependency")
+                  # The official v3.0.3 release adds the two WebAssembly APIs
+                  # called by this upstream noPython source revision. Keep
+                  # every other archive at its previously verified version.
+                  url = (
+                      "https://github.com/holzschu/ios_system/releases/"
+                      "download/v3.0.3/ios_system.xcframework.zip"
+                  )
+                  expected = "50f1692873e73fd862f45f73f2c08745e822c01ff5e0a0e0aec7fed6bb946e7f"
               targets.append((name, url, expected))
           if not targets:
               raise SystemExit("No a-Shell-noPython binary targets found")
@@ -487,6 +498,72 @@ jobs:
               raise SystemExit("Missing required framework paths:\n" + "\n".join(sorted(missing)))
           print("All official noPython embedded frameworks have iOS arm64 device slices")
           PY
+
+      - name: Preflight ios_system WebAssembly ABI and Swift import
+        shell: bash
+        run: |
+          cd a-shell
+          python3 - <<'PY'
+          import plistlib
+          import re
+          import subprocess
+          from pathlib import Path
+
+          framework = Path("xcfs/.build/artifacts/xcfs/ios_system.xcframework")
+          with (framework / "Info.plist").open("rb") as stream:
+              metadata = plistlib.load(stream)
+          device = [
+              library for library in metadata.get("AvailableLibraries", [])
+              if library.get("SupportedPlatform") == "ios"
+              and not library.get("SupportedPlatformVariant")
+              and "arm64" in library.get("SupportedArchitectures", [])
+          ]
+          if len(device) != 1:
+              raise SystemExit("Expected one iOS arm64 ios_system device slice")
+          library = device[0]
+          bundle = framework / library["LibraryIdentifier"] / library["LibraryPath"]
+          binary = bundle / "ios_system"
+          header = bundle / "Headers/ios_system.h"
+          module_map = bundle / "Modules/module.modulemap"
+          if not all(path.is_file() for path in (binary, header, module_map)):
+              raise SystemExit("ios_system binary, public header, or module map missing")
+          declarations = {
+              "finishedPreparingWebAssemblyCommand":
+                  r"extern\s+void\s+finishedPreparingWebAssemblyCommand\s*\(void\)\s*;",
+              "webAssemblyCommandOrder":
+                  r"extern\s+int\s+webAssemblyCommandOrder\s*\(void\)\s*;",
+          }
+          contents = header.read_text(encoding="utf-8")
+          for name, pattern in declarations.items():
+              if not re.search(pattern, contents):
+                  raise SystemExit(f"Public ios_system header lacks {name}")
+          if 'framework module ios_system' not in module_map.read_text(encoding="utf-8"):
+              raise SystemExit("ios_system Swift/Clang module map missing")
+          architectures = subprocess.check_output(
+              ["xcrun", "lipo", "-archs", str(binary)], text=True,
+          ).split()
+          if "arm64" not in architectures:
+              raise SystemExit("ios_system binary lacks arm64 architecture")
+          symbols = subprocess.check_output(
+              ["xcrun", "nm", "-gU", str(binary)], text=True,
+          )
+          for name in declarations:
+              if not re.search(rf"(?m)\b[Tt]\s+_{name}$", symbols):
+                  raise SystemExit(f"ios_system arm64 binary does not export {name}")
+          print("Official ios_system v3.0.3 exports both WebAssembly APIs on iOS arm64")
+          PY
+          cat > "$RUNNER_TEMP/check-ios-system.swift" <<'SWIFT'
+          import ios_system
+          func checkWebAssemblyAPI() {
+              finishedPreparingWebAssemblyCommand()
+              _ = webAssemblyCommandOrder()
+          }
+          SWIFT
+          xcrun --sdk iphoneos swiftc -typecheck \
+            -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -target arm64-apple-ios14.0 \
+            -F xcfs/.build/artifacts/xcfs/ios_system.xcframework/ios-arm64 \
+            "$RUNNER_TEMP/check-ios-system.swift"
 
       - name: Build verified a-Shell-noPython target without signing
         shell: bash
