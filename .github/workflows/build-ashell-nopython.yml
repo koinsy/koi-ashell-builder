@@ -141,7 +141,22 @@ jobs:
               stub.unlink()
           with dictionary_path.open("wb") as stream:
               plistlib.dump(dictionary, stream)
-          print("Linked official Vapor package; excluded only pico and multimarkdown")
+
+          # Free Apple ID signing cannot grant the upstream App Group. The
+          # upstream optional path otherwise reaches setenv as NULL and crashes
+          # during launch. Retain the shared path when available; use this app's
+          # own Library directory for standalone sideloaded installs.
+          delegate_path = Path("a-Shell/AppDelegate.swift")
+          delegate = delegate_path.read_text(encoding="utf-8")
+          group_lookup = (
+              'FileManager().containerURL(forSecurityApplicationGroupIdentifier:'
+              '"group.AsheKube.a-Shell")?.path'
+          )
+          if delegate.count(group_lookup) != 2:
+              raise SystemExit("Official AppDelegate App Group setup changed")
+          delegate = delegate.replace(group_lookup, f"({group_lookup} ?? libraryURL.path)")
+          delegate_path.write_text(delegate, encoding="utf-8")
+          print("Linked official Vapor package; excluded pico and multimarkdown; guarded App Group fallback")
           PY
 
       - name: Preflight Xcode project and Vapor linkage
@@ -185,7 +200,14 @@ jobs:
           for source in ("a-Shell/AppDelegate.swift", "a-Shell/SceneDelegate.swift"):
               if "import Vapor" not in Path(source).read_text(encoding="utf-8"):
                   raise SystemExit(f"Expected official Vapor import missing in {source}")
-          print("Official Vapor package linked to noPython target and imports")
+          delegate = Path("a-Shell/AppDelegate.swift").read_text(encoding="utf-8")
+          fallback = (
+              '(FileManager().containerURL(forSecurityApplicationGroupIdentifier:'
+              '"group.AsheKube.a-Shell")?.path ?? libraryURL.path)'
+          )
+          if delegate.count(fallback) != 2:
+              raise SystemExit("Sideload-safe SHORTCUTS/GROUP path fallback missing")
+          print("Official Vapor package linked; App Group startup fallback verified")
           PY
           xcodebuild -resolvePackageDependencies \
             -project a-Shell.xcodeproj \
